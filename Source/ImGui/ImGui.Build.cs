@@ -3,7 +3,7 @@
 public class ImGui : ModuleRules
 {
 	protected virtual bool WithImPlot => true;
-	protected virtual bool WithNetImGui => true;
+	protected virtual bool WithNetImGui => false;
 
 	public ImGui(ReadOnlyTargetRules Target) : base(Target)
 	{

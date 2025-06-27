@@ -11,6 +11,7 @@
 
 #if WITH_ENGINE
 #include <ImageUtils.h>
+#include <RHITypes.h>
 #endif
 
 THIRD_PARTY_INCLUDES_START
@@ -353,16 +354,17 @@ void FImGuiContext::Initialize()
 	IO.UserData = this;
 
 	IO.ConfigNavMoveSetMousePos = true;
+	IO.ConfigDpiScaleViewports = true;
 	IO.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 	IO.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
 	IO.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
-	IO.ConfigFlags |= ImGuiConfigFlags_DpiEnableScaleViewports;
 
 	IO.BackendFlags |= ImGuiBackendFlags_HasMouseCursors;
 	IO.BackendFlags |= ImGuiBackendFlags_HasSetMousePos;
 	IO.BackendFlags |= ImGuiBackendFlags_PlatformHasViewports;
 	IO.BackendFlags |= ImGuiBackendFlags_RendererHasViewports;
 	IO.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;
+	IO.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
 
 #if UE_VERSION_OLDER_THAN(5, 5, 0)
 	const int32 PieSessionId = GPlayInEditorID;
@@ -456,6 +458,14 @@ FImGuiContext::~FImGuiContext()
 
 	if (Context)
 	{
+		for (ImTextureData* TextureData : Context->PlatformIO.Textures)
+		{
+			if (TextureData->RefCount == 1)
+			{
+				DestroyTexture(TextureData);
+			}
+		}
+
 		ImGui::DestroyContext(Context);
 		Context = nullptr;
 	}
@@ -572,6 +582,79 @@ void FImGuiContext::OnDisplayMetricsChanged(const FDisplayMetrics& DisplayMetric
 	}
 }
 
+void FImGuiContext::CreateTexture(ImTextureData* TextureData)
+{
+#if WITH_ENGINE
+	UTexture2D* Texture = UTexture2D::CreateTransient(
+		TextureData->Width, TextureData->Height, PF_B8G8R8A8, NAME_None,
+		MakeConstArrayView(static_cast<uint8*>(TextureData->GetPixels()), TextureData->GetSizeInBytes())
+	);
+
+#if UE_VERSION_OLDER_THAN(5, 6, 0)
+	// Fix for tiled platforms prior to 5.6, see https://github.com/EpicGames/UnrealEngine/commit/f776b2b
+	Texture->bNotOfflineProcessed = true;
+	Texture->UpdateResource();
+#endif
+
+	TextureData->SetTexID(Texture);
+#else
+	// #TODO: Create Slate brush
+	unimplemented();
+#endif
+
+	TextureData->SetStatus(ImTextureStatus_OK);
+	Textures.Emplace(TextureData->GetTexID());
+}
+
+void FImGuiContext::UpdateTexture(ImTextureData* TextureData)
+{
+#if WITH_ENGINE
+	UTexture2D* Texture = Cast<UTexture2D>(TextureData->GetTexID());
+	if (IsValid(Texture))
+	{
+		const int32 NumRegions = TextureData->Updates.size();
+		FUpdateTextureRegion2D* Regions = static_cast<FUpdateTextureRegion2D*>(FMemory::Malloc(sizeof(FUpdateTextureRegion2D) * NumRegions));
+
+		for (int32 RegionIdx = 0; RegionIdx < NumRegions; ++RegionIdx)
+		{
+			const ImTextureRect& Rect = TextureData->Updates[RegionIdx];
+
+			FUpdateTextureRegion2D& Region = Regions[RegionIdx];
+			Region.DestX = Region.SrcX = Rect.x;
+			Region.DestY = Region.SrcY = Rect.y;
+			Region.Width = Rect.w;
+			Region.Height = Rect.h;
+		}
+
+		Texture->UpdateTextureRegions(
+			0, NumRegions, Regions,
+			TextureData->GetPitch(), TextureData->BytesPerPixel,
+			static_cast<uint8*>(TextureData->GetPixels()),
+			[](uint8*, const FUpdateTextureRegion2D* Regions)
+			{
+				FMemory::Free(const_cast<FUpdateTextureRegion2D*>(Regions));
+			}
+		);
+	}
+#else
+	// #TODO: Update Slate brush
+	unimplemented();
+#endif
+
+	TextureData->SetStatus(ImTextureStatus_OK);
+}
+
+void FImGuiContext::DestroyTexture(ImTextureData* TextureData)
+{
+	Textures.RemoveAllSwap([Texture = TextureData->GetTexID()](const FTextureRef& TextureRef)
+	{
+		return TextureRef.Get() == Texture;
+	});
+
+	TextureData->SetTexID(ImTextureID_Invalid);
+	TextureData->SetStatus(ImTextureStatus_Destroyed);
+}
+
 void FImGuiContext::BeginFrame()
 {
 	if (Context->WithinFrameScope)
@@ -593,24 +676,6 @@ void FImGuiContext::BeginFrame()
 	IO.DeltaTime = FApp::GetDeltaTime();
 	IO.DisplaySize = ImGui_GetWindowSize(ImGui::GetMainViewport());
 
-	if (!IO.Fonts->IsBuilt() || !FontAtlasTexturePtr.IsValid())
-	{
-		uint8* TextureData;
-		int32 TextureWidth, TextureHeight, BytesPerPixel;
-		IO.Fonts->GetTexDataAsRGBA32(&TextureData, &TextureWidth, &TextureHeight, &BytesPerPixel);
-
-#if WITH_ENGINE
-		const FImageView TextureView(TextureData, TextureWidth, TextureHeight, ERawImageFormat::BGRA8);
-		FontAtlasTexturePtr.Reset(FImageUtils::CreateTexture2DFromImage(TextureView));
-#else
-		FontAtlasTexturePtr = FSlateDynamicImageBrush::CreateWithImageData(
-			TEXT("ImGuiFontAtlas"), FVector2D(TextureWidth, TextureHeight),
-			TArray(TextureDataRaw, TextureWidth * TextureHeight * BytesPerPixel));
-#endif
-
-		IO.Fonts->SetTexID(FontAtlasTexturePtr.Get());
-	}
-
 	ImGui::NewFrame();
 }
 
@@ -625,6 +690,25 @@ void FImGuiContext::EndFrame()
 
 	ImGui::Render();
 	ImGui::UpdatePlatformWindows();
+
+	// #TODO: Probably don't need to handle textures when remote, check NetImGui when updated
+	for (ImTextureData* TextureData : ImGui::GetPlatformIO().Textures)
+	{
+		if (TextureData->Status == ImTextureStatus_WantCreate)
+		{
+			CreateTexture(TextureData);
+		}
+
+		if (TextureData->Status == ImTextureStatus_WantUpdates)
+		{
+			UpdateTexture(TextureData);
+		}
+
+		if (TextureData->Status == ImTextureStatus_WantDestroy && TextureData->UnusedFrames > 0)
+		{
+			DestroyTexture(TextureData);
+		}
+	}
 
 #if WITH_NETIMGUI
 	if (!bIsRemote)

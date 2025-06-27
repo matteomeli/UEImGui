@@ -14,6 +14,7 @@ struct FSlateBrush;
 struct ImGuiContext;
 struct ImGuiViewport;
 struct ImPlotContext;
+struct ImTextureData;
 
 struct IMGUI_API FImGuiViewportData
 {
@@ -65,6 +66,10 @@ private:
 
 	void OnDisplayMetricsChanged(const FDisplayMetrics& DisplayMetrics);
 
+	void CreateTexture(ImTextureData* TextureData);
+	void UpdateTexture(ImTextureData* TextureData);
+	void DestroyTexture(ImTextureData* TextureData);
+
 	ImGuiContext* Context = nullptr;
 
 #if WITH_IMPLOT
@@ -80,8 +85,10 @@ private:
 #endif
 
 #if WITH_ENGINE
-	TStrongObjectPtr<UTexture2D> FontAtlasTexturePtr = nullptr;
+	using FTextureRef = TStrongObjectPtr<UTexture>;
 #else
-	TSharedPtr<FSlateBrush> FontAtlasTexturePtr = nullptr;
+	using FTextureRef = TSharedPtr<FSlateBrush>;
 #endif
+
+	TArray<FTextureRef> Textures;
 };
