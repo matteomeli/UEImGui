@@ -6,12 +6,16 @@
 #include <HAL/PlatformProcess.h>
 #include <HAL/PlatformString.h>
 #include <HAL/UnrealMemory.h>
+#include <Misc/App.h>
 #include <Misc/EngineVersionComparison.h>
 #include <Widgets/SWindow.h>
 
 #if WITH_ENGINE
 #include <ImageUtils.h>
 #include <RHITypes.h>
+#include <UObject/Package.h>
+#else
+#include <Textures/SlateUpdatableTexture.h>
 #endif
 
 THIRD_PARTY_INCLUDES_START
@@ -374,6 +378,7 @@ void FImGuiContext::Initialize()
 
 	// Ensure each PIE session has a uniquely identifiable context
 	const FString ContextName = (PieSessionId > 0 ? FString::Printf(TEXT("ImGui_%d"), PieSessionId) : TEXT("ImGui"));
+	FPlatformString::Convert(reinterpret_cast<UTF8CHAR*>(Context->ContextName), UE_ARRAY_COUNT(Context->ContextName), *ContextName, ContextName.Len() + 1);
 
 	const FString IniFilename = FPaths::GeneratedConfigDir() / FPlatformProperties::PlatformName() / ContextName + TEXT(".ini");
 	FPlatformString::Convert(reinterpret_cast<UTF8CHAR*>(IniFilenameUtf8), UE_ARRAY_COUNT(IniFilenameUtf8), *IniFilename, IniFilename.Len() + 1);
@@ -584,9 +589,12 @@ void FImGuiContext::OnDisplayMetricsChanged(const FDisplayMetrics& DisplayMetric
 
 void FImGuiContext::CreateTexture(ImTextureData* TextureData)
 {
+	const FName TextureName(WriteToString<32>("ImGuiTexture_", TextureData->UniqueID));
+
 #if WITH_ENGINE
 	UTexture2D* Texture = UTexture2D::CreateTransient(
-		TextureData->Width, TextureData->Height, PF_B8G8R8A8, NAME_None,
+		TextureData->Width, TextureData->Height, PF_B8G8R8A8,
+		MakeUniqueObjectName(GetTransientPackage(), UTexture2D::StaticClass(), TextureName),
 		MakeConstArrayView(static_cast<uint8*>(TextureData->GetPixels()), TextureData->GetSizeInBytes())
 	);
 
@@ -597,48 +605,65 @@ void FImGuiContext::CreateTexture(ImTextureData* TextureData)
 #endif
 
 	TextureData->SetTexID(Texture);
+
+	Textures.Emplace(Texture);
 #else
-	// #TODO: Create Slate brush
-	unimplemented();
+	FSlateUpdatableTexture* Texture = FSlateApplication::Get().GetRenderer()->CreateUpdatableTexture(TextureData->Width, TextureData->Height);
+	Texture->UpdateTextureThreadSafeRaw(TextureData->Width, TextureData->Height, TextureData->GetPixels());
+
+	// Create a Slate brush and swap its underlying resource to an updatable texture
+	TSharedPtr<FSlateBrush> Brush = MakeShared<FSlateDynamicImageBrush>(TextureName, FVector2D(TextureData->Width, TextureData->Height));
+	const FSlateResourceHandle& BrushResourceHandle = Brush->GetRenderingResource();
+	FSlateShaderResourceProxy* BrushResourceProxy = const_cast<FSlateShaderResourceProxy*>(BrushResourceHandle.GetResourceProxy());
+	BrushResourceProxy->Resource = Texture->GetSlateResource();
+
+	TextureData->SetTexID(Brush.Get());
+	TextureData->BackendUserData = Texture;
+
+	Textures.Emplace(MoveTemp(Brush));
 #endif
 
 	TextureData->SetStatus(ImTextureStatus_OK);
-	Textures.Emplace(TextureData->GetTexID());
 }
 
 void FImGuiContext::UpdateTexture(ImTextureData* TextureData)
 {
 #if WITH_ENGINE
 	UTexture2D* Texture = Cast<UTexture2D>(TextureData->GetTexID());
-	if (IsValid(Texture))
+
+	const int32 NumRegions = TextureData->Updates.size();
+	FUpdateTextureRegion2D* Regions = static_cast<FUpdateTextureRegion2D*>(FMemory::Malloc(sizeof(FUpdateTextureRegion2D) * NumRegions));
+
+	for (int32 RegionIdx = 0; RegionIdx < NumRegions; ++RegionIdx)
 	{
-		const int32 NumRegions = TextureData->Updates.size();
-		FUpdateTextureRegion2D* Regions = static_cast<FUpdateTextureRegion2D*>(FMemory::Malloc(sizeof(FUpdateTextureRegion2D) * NumRegions));
+		const ImTextureRect& Rect = TextureData->Updates[RegionIdx];
 
-		for (int32 RegionIdx = 0; RegionIdx < NumRegions; ++RegionIdx)
-		{
-			const ImTextureRect& Rect = TextureData->Updates[RegionIdx];
-
-			FUpdateTextureRegion2D& Region = Regions[RegionIdx];
-			Region.DestX = Region.SrcX = Rect.x;
-			Region.DestY = Region.SrcY = Rect.y;
-			Region.Width = Rect.w;
-			Region.Height = Rect.h;
-		}
-
-		Texture->UpdateTextureRegions(
-			0, NumRegions, Regions,
-			TextureData->GetPitch(), TextureData->BytesPerPixel,
-			static_cast<uint8*>(TextureData->GetPixels()),
-			[](uint8*, const FUpdateTextureRegion2D* Regions)
-			{
-				FMemory::Free(const_cast<FUpdateTextureRegion2D*>(Regions));
-			}
-		);
+		FUpdateTextureRegion2D& Region = Regions[RegionIdx];
+		Region.DestX = Region.SrcX = Rect.x;
+		Region.DestY = Region.SrcY = Rect.y;
+		Region.Width = Rect.w;
+		Region.Height = Rect.h;
 	}
+
+	Texture->UpdateTextureRegions(
+		0, NumRegions, Regions,
+		TextureData->GetPitch(), TextureData->BytesPerPixel,
+		static_cast<uint8*>(TextureData->GetPixels()),
+		[](uint8*, const FUpdateTextureRegion2D* Regions)
+		{
+			FMemory::Free(const_cast<FUpdateTextureRegion2D*>(Regions));
+		}
+	);
 #else
-	// #TODO: Update Slate brush
-	unimplemented();
+	FSlateUpdatableTexture* Texture = static_cast<FSlateUpdatableTexture*>(TextureData->BackendUserData);
+
+	const FIntRect Region(
+		TextureData->UpdateRect.x, TextureData->UpdateRect.y,
+		TextureData->UpdateRect.x + TextureData->UpdateRect.w,
+		TextureData->UpdateRect.y + TextureData->UpdateRect.h
+	);
+
+	Texture->UpdateTextureThreadSafeRaw(TextureData->Width, TextureData->Height, TextureData->GetPixels(), Region);
 #endif
 
 	TextureData->SetStatus(ImTextureStatus_OK);
@@ -646,6 +671,21 @@ void FImGuiContext::UpdateTexture(ImTextureData* TextureData)
 
 void FImGuiContext::DestroyTexture(ImTextureData* TextureData)
 {
+#if WITH_ENGINE
+	UTexture2D* Texture = Cast<UTexture2D>(TextureData->GetTexID());
+
+	// Release the texture resource immediately but let GC clean up the object
+	Texture->ReleaseResource();
+#else
+	if (FSlateApplication::IsInitialized())
+	{
+		FSlateUpdatableTexture* Texture = static_cast<FSlateUpdatableTexture*>(TextureData->BackendUserData);
+		FSlateApplication::Get().GetRenderer()->ReleaseUpdatableTexture(Texture);
+	}
+
+	TextureData->BackendUserData = nullptr;
+#endif
+
 	Textures.RemoveAllSwap([Texture = TextureData->GetTexID()](const FTextureRef& TextureRef)
 	{
 		return TextureRef.Get() == Texture;
@@ -698,13 +738,11 @@ void FImGuiContext::EndFrame()
 		{
 			CreateTexture(TextureData);
 		}
-
-		if (TextureData->Status == ImTextureStatus_WantUpdates)
+		else if (TextureData->Status == ImTextureStatus_WantUpdates)
 		{
 			UpdateTexture(TextureData);
 		}
-
-		if (TextureData->Status == ImTextureStatus_WantDestroy && TextureData->UnusedFrames > 0)
+		else if (TextureData->Status == ImTextureStatus_WantDestroy && TextureData->UnusedFrames > 0)
 		{
 			DestroyTexture(TextureData);
 		}
