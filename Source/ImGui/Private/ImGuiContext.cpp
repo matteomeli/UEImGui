@@ -447,6 +447,7 @@ FImGuiContext::~FImGuiContext()
 			}
 		}
 
+		ImGui::DestroyPlatformWindows();
 		ImGui::DestroyContext(Context);
 		Context = nullptr;
 	}
